@@ -77,14 +77,12 @@ function distanceToPath(lat, lng, pts) {
   return best;
 }
 
-/** 초 → "MM:SS" 또는 "H:MM:SS" */
+/** 초 → "시:분" (예: 24분 → 0:24, 1시간 1분 → 1:01) */
 function formatTime(sec) {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  const pad = (n) => String(n).padStart(2, '0');
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+  return `${h}:${String(m).padStart(2, '0')}`;
 }
 
 /** 페이스(1km당 걸리는 시간) → "5'30"" */
