@@ -302,6 +302,27 @@ select {
   -webkit-appearance: none;
 }
 
+/* ---------- 걷기 화면 지도 ---------- */
+.walkmap-wrap {
+  position: relative;
+  height: 210px;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  margin-bottom: 8px;
+}
+#walkMap { position: absolute; inset: 0; background: #1a1d24; }
+.follow-btn { position: absolute; right: 8px; bottom: 8px; z-index: 500; opacity: .5; }
+.follow-btn.on { opacity: 1; border-color: var(--accent); color: var(--accent); }
+.gps-raw {
+  font-size: 11px;
+  color: #6b7385;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 12px;
+  padding-left: 2px;
+  line-height: 1.5;
+}
+
 .big-stats {
   background: var(--panel);
   border: 1px solid var(--line);

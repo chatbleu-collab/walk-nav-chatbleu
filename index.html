@@ -98,6 +98,13 @@
         </select>
       </div>
 
+      <!-- 걷는 동안 내 위치와 코스를 함께 보여주는 지도 -->
+      <div class="walkmap-wrap">
+        <div id="walkMap"></div>
+        <button class="mini follow-btn on" id="btnFollow" type="button" title="내 위치 따라가기">◎</button>
+      </div>
+      <div class="gps-raw" id="gpsRaw">위치 확인 중…</div>
+
       <div class="big-stats">
         <div class="big">
           <div class="big-value" id="wDistance">0.00</div>
@@ -141,7 +148,14 @@
       <details class="settings">
         <summary>설정</summary>
         <div class="setting-item">
-          <label for="setVoiceEvery">음성 안내 간격</label>
+          <label for="setTurnGuide">회전 안내 (내비게이션)</label>
+          <select id="setTurnGuide">
+            <option value="1" selected>켜기 — "300미터 앞에서 우회전"</option>
+            <option value="0">끄기</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label for="setVoiceEvery">거리 안내 간격</label>
           <select id="setVoiceEvery">
             <option value="250">250 m</option>
             <option value="500" selected>500 m</option>
@@ -166,6 +180,13 @@
             <option value="70" selected>70 kg</option>
             <option value="80">80 kg</option>
             <option value="90">90 kg</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label for="setFilter">GPS 처리 방식</label>
+          <select id="setFilter">
+            <option value="1" selected>표준 (떨림 보정 — 거리 정확)</option>
+            <option value="0">원시값 그대로 (보정 없음)</option>
           </select>
         </div>
         <div class="setting-item">

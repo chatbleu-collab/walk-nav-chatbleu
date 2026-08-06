@@ -107,54 +107,272 @@ function toast(msg, ms = 2600) {
 
 
 /**
- * 경로 단순화 — Douglas-Peucker 알고리즘
- * ------------------------------------------------------------
- * GPS 기록기는 1~5m마다 점을 찍기 때문에 5km 코스가 3천 개 점이 되곤 합니다.
- * 모양은 그대로 두고 점 개수만 줄여서 앱이 느려지지 않게 합니다.
- * tolMeters: 이 거리 안쪽으로 벗어나는 점은 없애도 된다고 판단
+ * 두 좌표 사이의 방위각 (0~360도, 정북=0, 시계방향)
  */
-function simplifyPath(pts, tolMeters) {
-  const n = pts.length;
-  if (n <= 2 || tolMeters <= 0) return pts.slice();
+function bearing(lat1, lon1, lat2, lon2) {
+  const R = Math.PI / 180;
+  const dLon = (lon2 - lon1) * R;
+  const y = Math.sin(dLon) * Math.cos(lat2 * R);
+  const x = Math.cos(lat1 * R) * Math.sin(lat2 * R) -
+            Math.sin(lat1 * R) * Math.cos(lat2 * R) * Math.cos(dLon);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
 
-  // 짧은 범위에서는 위경도를 평면 좌표(미터)로 근사해도 됩니다.
-  const toRad = Math.PI / 180;
-  const lat0 = pts[0][0];
-  const kx = EARTH_R * toRad * Math.cos(lat0 * toRad); // 경도 1도 → 미터
-  const ky = EARTH_R * toRad;                          // 위도 1도 → 미터
-  const P = pts.map((p) => [p[1] * kx, p[0] * ky]);
+/** 방위각 차이를 -180~+180 으로 정규화 (양수=오른쪽, 음수=왼쪽) */
+function angleDiff(from, to) {
+  return ((to - from + 540) % 360) - 180;
+}
 
-  const keep = new Array(n).fill(false);
-  keep[0] = true;
-  keep[n - 1] = true;
 
-  const stack = [[0, n - 1]];
-  while (stack.length) {
-    const [s, e] = stack.pop();
-    if (e - s < 2) continue;
+/* ============================================================
+   1-B. 경로 안내 (턴바이턴)
+   ------------------------------------------------------------
+   GPX 경로의 꺾이는 각도만으로 회전 지점을 찾아냅니다.
+   인터넷도 지도 API도 필요 없이 좌표 계산만으로 동작합니다.
+   ============================================================ */
 
-    const ax = P[s][0], ay = P[s][1];
-    const bx = P[e][0], by = P[e][1];
-    const dx = bx - ax, dy = by - ay;
-    const len2 = dx * dx + dy * dy;
+const Navi = (() => {
+  let orig = [];       // 원본 좌표 — 지도 표시용. 절대 변형하지 않음
+  let route = [];      // 계산용 좌표 — 원본이거나 평활화 사본 (개수·순서 동일)
+  let cum = [];        // route 기준 누적 거리(m). 앱 전체에서 이 척도 하나만 씀
+  let total = 0;
+  let turns = [];
+  let nextIdx = 0;
+  let lastStraightAt = -1;
 
-    let maxD = -1, idx = -1;
-    for (let i = s + 1; i < e; i++) {
-      const px = P[i][0], py = P[i][1];
-      let t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
-      t = Math.max(0, Math.min(1, t));
-      const d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
-      if (d > maxD) { maxD = d; idx = i; }
+  let LOOK = 30;           // m — 회전 판정용 앞뒤 구간 (노이즈에 따라 자동 조절)
+  let SMOOTH_R = 20;       // m — 평활화 반경 (노이즈에 따라 자동 조절)
+  let smoothOn = false;    // 깨끗한 코스면 평활화를 아예 하지 않음
+  let TURN_MIN = 30;       // 도 — 이보다 작으면 회전이 아님 (노이즈에 따라 조절)
+
+  const MERGE_DIST = 25;   // m — 이 안에 겹친 후보는 하나로 합침
+  const TRIGGERS = [400, 200, 80, 25];   // 안내 시점 (m 전)
+  const STRAIGHT_MIN = 400;              // 이보다 긴 직선은 "직진하세요"
+
+  /* ----------------------------------------------------------
+     코스가 얼마나 흔들리는지 측정
+     각 점이 '앞뒤 15m를 이은 직선'에서 벗어난 거리의 중앙값.
+     중앙값이라 소수의 진짜 코너에 값이 끌려가지 않습니다.
+     점이 성긴 코스는 표본이 없어 0(깨끗함)으로 봅니다.
+     ---------------------------------------------------------- */
+  function estimateNoise(pts, c) {
+    const devs = [];
+    for (let i = 1; i < pts.length - 1; i++) {
+      let a = i, b = i;
+      while (a > 0 && c[i] - c[a] < 15) a--;
+      while (b < pts.length - 1 && c[b] - c[i] < 15) b++;
+      if (a === i || b === i) continue;
+      devs.push(distanceToPath(pts[i][0], pts[i][1], [pts[a], pts[b]]));
     }
+    if (devs.length < 10) return 0;
+    devs.sort((x, y) => x - y);
+    return devs[Math.floor(devs.length / 2)];
+  }
 
-    if (maxD > tolMeters && idx > 0) {
-      keep[idx] = true;
-      stack.push([s, idx], [idx, e]);
+  /** 측정된 노이즈에 맞춰 판정 폭 결정 (실측으로 정한 구간) */
+  function tune(noise) {
+    if (noise < 0.8) {
+      // 손으로 찍은 코스, 깨끗한 계획 경로 → 원본을 그대로 씁니다.
+      // 평활화하면 거리가 미세하게 짧아지므로 아예 건드리지 않습니다.
+      smoothOn = false; LOOK = 30; SMOOTH_R = 0;  TURN_MIN = 30;
+    } else if (noise <= 2.2) {
+      smoothOn = true;  LOOK = 30; SMOOTH_R = 20; TURN_MIN = 30;
+    } else if (noise <= 4.5) {
+      smoothOn = true;  LOOK = 35; SMOOTH_R = 25; TURN_MIN = 35;
+    } else {
+      smoothOn = true;  LOOK = 45; SMOOTH_R = 35; TURN_MIN = 45;
     }
   }
 
-  return pts.filter((_, i) => keep[i]);
-}
+  /* ----------------------------------------------------------
+     끝점을 보존하는 평활화
+     ------------------------------------------------------------
+     각 점의 평균 반경을 '양쪽 끝까지의 거리'로 제한합니다.
+     → 첫 점과 끝 점은 이웃이 없어 반경 0이 되어 원위치에 그대로 남고,
+       중앙부는 온전한 반경으로 평활화됩니다.
+     한쪽만 평균 내던 기존 방식은 양 끝을 안쪽으로 10m씩 끌어당겨
+     경로 전체 척도를 어긋나게 만들었습니다. 그 결함을 없앤 방식입니다.
+     ---------------------------------------------------------- */
+  function smooth(pts, c) {
+    const end = c[c.length - 1];
+    return pts.map((p, i) => {
+      const r = Math.min(SMOOTH_R, c[i], end - c[i]);   // 끝에 가까울수록 좁아짐
+      if (r <= 0) return [p[0], p[1]];                  // 첫 점·끝 점은 그대로
+      let a = 0, o = 0, n = 0;
+      for (let k = i; k >= 0 && c[i] - c[k] <= r; k--) { a += pts[k][0]; o += pts[k][1]; n++; }
+      for (let k = i + 1; k < pts.length && c[k] - c[i] <= r; k++) { a += pts[k][0]; o += pts[k][1]; n++; }
+      return [a / n, o / n];
+    });
+  }
+
+  /** 누적거리 d 이상인 첫 배열 위치 (이분 탐색) */
+  function idxAt(d) {
+    let lo = 0, hi = cum.length - 1;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] < d) lo = m + 1; else hi = m; }
+    return lo;
+  }
+
+  /** 시작점에서 d미터 지점의 좌표 (구간 사이는 보간) */
+  function pointAt(d) {
+    if (route.length === 0) return null;
+    if (d <= 0) return route[0];
+    if (d >= total) return route[route.length - 1];
+    const i = Math.max(1, idxAt(d));
+    const seg = cum[i] - cum[i - 1];
+    const t = seg > 0 ? (d - cum[i - 1]) / seg : 0;
+    return [route[i - 1][0] + (route[i][0] - route[i - 1][0]) * t,
+            route[i - 1][1] + (route[i][1] - route[i - 1][1]) * t];
+  }
+
+  /**
+   * d0~d1 구간 '안에 실제로 들어있는' 점들의 평균.
+   * 범위 밖 점을 섞으면 성긴 코스에서 진행 방향이 반대로 나옵니다.
+   * 구간 안에 점이 없으면(간격이 넓은 코스) 보간값을 씁니다.
+   */
+  function avgPoint(d0, d1) {
+    d0 = Math.max(0, d0); d1 = Math.min(total, d1);
+    let a = 0, o = 0, n = 0;
+    for (let i = idxAt(d0); i < route.length && cum[i] <= d1; i++) {
+      if (cum[i] >= d0) { a += route[i][0]; o += route[i][1]; n++; }
+    }
+    if (n === 0) return pointAt((d0 + d1) / 2);
+    return [a / n, o / n];
+  }
+
+  /** 꺾인 각도를 한국어로 (양수 = 오른쪽) */
+  function describe(delta) {
+    const a = Math.abs(delta), right = delta > 0;
+    if (a >= 150) return '유턴';
+    if (a >= 115) return right ? '크게 우회전' : '크게 좌회전';
+    if (a >= 55)  return right ? '우회전' : '좌회전';
+    return right ? '오른쪽 방향' : '왼쪽 방향';
+  }
+
+  /* ----------------------------------------------------------
+     코스 분석 — 회전 지점 목록 만들기
+     ---------------------------------------------------------- */
+  function build(pts) {
+    turns = []; nextIdx = 0; lastStraightAt = -1;
+    orig = pts || []; route = []; cum = [0]; total = 0;
+    if (orig.length < 2) return;
+
+    // 1) 원본 기준 누적거리로 노이즈를 재고 판정 폭을 정합니다.
+    const c0 = [0];
+    for (let i = 1; i < orig.length; i++) {
+      c0[i] = c0[i - 1] + haversine(orig[i - 1][0], orig[i - 1][1], orig[i][0], orig[i][1]);
+    }
+    tune(estimateNoise(orig, c0));
+
+    // 2) 계산용 좌표 확정.
+    //    깨끗한 코스는 원본 그대로, 흔들리는 트랙만 평활화합니다.
+    //    노이즈 낀 원본으로 거리를 재면 실제의 2배 넘게 부풀려집니다.
+    route = smoothOn ? smooth(orig, c0) : orig.slice();
+
+    for (let i = 1; i < route.length; i++) {
+      total += haversine(route[i - 1][0], route[i - 1][1], route[i][0], route[i][1]);
+      cum[i] = total;
+    }
+
+    // 3) 각 지점 앞뒤 구간의 진행 방향을 비교해 회전을 찾습니다.
+    //    기준점 네 개를 모두 '구간 평균'으로 잡아야 흔들림이 상쇄됩니다.
+    const H = LOOK / 2;
+    const cand = [];
+    for (let i = 1; i < route.length - 1; i++) {
+      const d = cum[i];
+      if (d < LOOK || d > total - LOOK) continue;
+      const a1 = avgPoint(d - LOOK, d - H), a2 = avgPoint(d - H, d);
+      const b1 = avgPoint(d, d + H),        b2 = avgPoint(d + H, d + LOOK);
+      const delta = angleDiff(bearing(a1[0], a1[1], a2[0], a2[1]),
+                              bearing(b1[0], b1[1], b2[0], b2[1]));
+      if (Math.abs(delta) >= TURN_MIN) cand.push({ along: d, delta, idx: i });
+    }
+
+    // 4) 가까이 붙은 후보는 가장 크게 꺾인 것 하나로 합칩니다.
+    for (const c of cand) {
+      const p = turns[turns.length - 1];
+      if (p && c.along - p.along < MERGE_DIST) {
+        if (Math.abs(c.delta) > Math.abs(p.delta)) { p.along = c.along; p.delta = c.delta; p.idx = c.idx; }
+      } else {
+        turns.push({ along: c.along, delta: c.delta, idx: c.idx });
+      }
+    }
+    turns.forEach((t) => { t.text = describe(t.delta); t.said = {}; });
+    turns.push({ along: total, delta: 0, text: '도착', arrive: true, said: {} });
+  }
+
+  /** 현재 위치를 경로에 투영 → 진행 거리(along)와 이탈 거리(offset) */
+  function project(lat, lng) {
+    if (route.length < 2) return null;
+    const R = Math.PI / 180;
+    const ky = EARTH_R * R, kx = EARTH_R * R * Math.cos(lat * R);
+    const px = lng * kx, py = lat * ky;
+    let best = Infinity, along = 0;
+    for (let i = 1; i < route.length; i++) {
+      const ax = route[i - 1][1] * kx, ay = route[i - 1][0] * ky;
+      const bx = route[i][1] * kx,     by = route[i][0] * ky;
+      const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+      let t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+      t = Math.max(0, Math.min(1, t));
+      const d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+      if (d < best) { best = d; along = cum[i - 1] + t * (cum[i] - cum[i - 1]); }
+    }
+    return { offset: best, along };
+  }
+
+  function round100(m) { return Math.max(100, Math.round(m / 100) * 100); }
+
+  /**
+   * 매 GPS 갱신마다 호출. 안내할 말이 있으면 문장을, 없으면 null을 돌려줍니다.
+   * onCourse=false(코스 이탈 중)이면 엉뚱한 회전을 알리지 않도록 멈춥니다.
+   */
+  function update(lat, lng, onCourse) {
+    if (!turns.length || !onCourse) return null;
+    const p = project(lat, lng);
+    if (!p) return null;
+
+    // 이미 지나친 회전은 건너뜁니다.
+    while (nextIdx < turns.length && turns[nextIdx].along < p.along - 12) nextIdx++;
+    if (nextIdx >= turns.length) return null;
+
+    const t = turns[nextIdx];
+    const rem = t.along - p.along;
+
+    // 다음 회전까지 멀면 직진 안내 (회전 한 곳당 한 번만)
+    if (lastStraightAt !== nextIdx && rem > STRAIGHT_MIN) {
+      lastStraightAt = nextIdx;
+      return `${round100(rem)}미터 직진하세요.`;
+    }
+
+    for (const trig of TRIGGERS) {
+      if (rem <= trig && !t.said[trig]) {
+        t.said[trig] = true;
+        if (t.arrive) {
+          return trig <= 25 ? '목적지에 도착했습니다.' : `목적지까지 ${trig}미터 남았습니다.`;
+        }
+        return trig <= 25 ? `잠시 후 ${t.text}입니다.` : `${trig}미터 앞에서 ${t.text}입니다.`;
+      }
+    }
+    return null;
+  }
+
+  /** 코스 이탈 후 복귀했을 때 진행 위치를 다시 잡습니다. */
+  function resync(lat, lng) {
+    const p = project(lat, lng);
+    if (!p) return;
+    nextIdx = 0;
+    while (nextIdx < turns.length && turns[nextIdx].along < p.along - 12) nextIdx++;
+    lastStraightAt = -1;
+  }
+
+  return {
+    build, update, resync, project,
+    // 지도 마커는 계산용 사본이 아니라 원본 좌표에 찍습니다.
+    getTurns: () => turns.filter((t) => !t.arrive)
+                         .map((t) => ({ along: t.along, text: t.text, point: orig[t.idx] })),
+    totalDistance: () => total,
+    ready: () => turns.length > 0
+  };
+})();
 
 
 /* ============================================================
@@ -179,11 +397,7 @@ const GPX = (() => {
    * GPX 텍스트 → { name, points, kind, original }
    * 실패하면 Error를 던집니다.
    */
-  // 단순화 허용 오차 (미터).
-  // 코스 이탈 경고 기준이 기본 50m이므로, 그보다 훨씬 작아야
-  // 단순화 때문에 엉뚱한 이탈 경고가 뜨지 않습니다.
-  // 도시에서 나란히 붙은 두 골목(약 15~20m 간격)도 구분되는 값입니다.
-  function parse(text, tolMeters = 8) {
+  function parse(text) {
     if (!text || !text.trim()) {
       throw new Error('파일이 비어 있습니다.');
     }
@@ -253,21 +467,10 @@ const GPX = (() => {
     }
     name = name.slice(0, 30);
 
-    // ── 점 개수 줄이기 ──
-    // GPS 기록기가 만든 촘촘한 트랙만 줄입니다.
-    // 손으로 찍은 경로(rtept)나 지점(wpt), 점이 적은 파일은
-    // 하나하나가 의도적으로 찍은 것이므로 절대 건드리지 않습니다.
-    const DENSE_THRESHOLD = 100;
-    const shouldSimplify = (kind === '트랙') && (raw.length > DENSE_THRESHOLD);
-    const points = shouldSimplify ? simplifyPath(raw, tolMeters) : raw;
-
-    return {
-      name,
-      points,
-      kind,
-      originalCount: raw.length,
-      originalDistance: pathLength(raw)
-    };
+    // ── 원본 좌표를 그대로 사용합니다 ──
+    // 점을 줄이면 코스 모양이 달라지고 그만큼 이탈 판정도 어긋납니다.
+    // 다운로드한 파일이든 직접 찍은 것이든 하나도 빼지 않고 전부 씁니다.
+    return { name, points: raw, kind, originalCount: raw.length };
   }
 
   /** XML에 그대로 넣으면 안 되는 문자 처리 */
@@ -775,6 +978,83 @@ function geoErrorMessage(err) {
 
 
 /* ============================================================
+   5-B. 걷기 화면 지도
+   ------------------------------------------------------------
+   따라 걸을 코스(초록), 실제로 걸은 궤적(파랑),
+   폰이 알려준 현재 위치와 그 오차 반경을 함께 보여줍니다.
+   ============================================================ */
+
+const WalkMap = (() => {
+  let map=null, courseLine=null, trackLine=null, me=null, accCircle=null, turnMarks=[];
+  let follow = true;
+
+  function init() {
+    if (map) return;
+    map = L.map('walkMap', { center: [37.5665,126.9780], zoom: 16, zoomControl: false });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+    courseLine = L.polyline([], { color:'#4ade80', weight:5, opacity:.85 }).addTo(map);
+    trackLine  = L.polyline([], { color:'#3b82f6', weight:4, opacity:.95 }).addTo(map);
+    map.on('dragstart', () => setFollow(false));  // 손으로 지도를 옮기면 따라가기 해제
+    setTimeout(() => map.invalidateSize(), 200);
+  }
+
+  function setFollow(on) {
+    follow = on;
+    const b = $('btnFollow');
+    if (b) b.classList.toggle('on', on);
+  }
+
+  function setCourse(pts) {
+    init();
+    courseLine.setLatLngs(pts || []);
+    if (pts && pts.length > 1) map.fitBounds(courseLine.getBounds(), { padding:[24,24] });
+  }
+
+  /** 폰이 준 위치를 그대로 표시. accuracy = 폰이 스스로 보고한 오차 반경(m) */
+  function show(lat, lng, accuracy) {
+    init();
+    if (!me) {
+      accCircle = L.circle([lat,lng], { radius: accuracy||0, color:'#3b82f6', weight:1,
+                                        fillColor:'#3b82f6', fillOpacity:.12 }).addTo(map);
+      me = L.marker([lat,lng], { zIndexOffset: 1000,
+        icon: L.divIcon({ className:'', html:'<div class="me-marker"></div>',
+                          iconSize:[18,18], iconAnchor:[9,9] }) }).addTo(map);
+    } else {
+      me.setLatLng([lat,lng]);
+      accCircle.setLatLng([lat,lng]);
+      accCircle.setRadius(accuracy||0);
+    }
+    if (follow) map.setView([lat,lng], Math.max(map.getZoom(),16), { animate:false });
+  }
+
+  /** 회전 지점을 지도에 노란 점으로 표시 */
+  function setTurns(turns) {
+    init();
+    turnMarks.forEach((m) => map.removeLayer(m));
+    turnMarks = [];
+    (turns || []).forEach((t, i) => {
+      const p = t.point;
+      if (!p) return;
+      turnMarks.push(
+        L.circleMarker(p, { radius: 5, color: '#0f1115', weight: 2,
+                            fillColor: '#fbbf24', fillOpacity: 1 })
+         .addTo(map).bindTooltip(`${i + 1}. ${t.text}`)
+      );
+    });
+  }
+
+  function addTrack(lat,lng){ init(); trackLine.addLatLng([lat,lng]); }
+  function reset(){ if(trackLine) trackLine.setLatLngs([]); setFollow(true); }
+
+  return { init, setCourse, setTurns, show, addTrack, reset, setFollow,
+           isFollowing: () => follow,
+           invalidate: () => { if (map) map.invalidateSize(); } };
+})();
+
+
+/* ============================================================
    6. 걷기 추적 (GPS)
    ============================================================ */
 
@@ -789,7 +1069,8 @@ const Tracker = (() => {
 
   let distance = 0;       // 누적 이동거리 (미터)
   let path = [];          // 실제 걸은 경로
-  let last = null;        // { lat, lng, t }
+  let last = null;        // 마지막으로 거리에 반영한 지점 { lat, lng, t }
+  let prev = null;        // 직전 측정값 — 튐 판정 전용
 
   let tickTimer = null;
   let nextVoiceAt = 0;    // 다음 음성 안내 거리 (미터)
@@ -801,17 +1082,17 @@ const Tracker = (() => {
 
   let courseRef = null;   // 따라 걷는 코스의 좌표 배열
 
-  // --- GPS 노이즈 필터 기준 ---
-  const MAX_ACCURACY = 35;   // m — 오차가 이보다 크면 무시
-  const MIN_MOVE = 1.5;      // m — 이보다 작으면 제자리 떨림으로 간주
-  const MAX_SPEED = 6.0;     // m/s (약 21 km/h) — 이보다 빠르면 GPS 튐
+  const MAX_SPEED = 6.0;      // m/s — 사람이 걸어서 낼 수 없는 속도
+  const TRUST_ACCURACY = 60;  // m — 이보다 오차가 크면 거리에 반영하지 않음
 
   function settings() {
     return {
       voiceEvery: Number($('setVoiceEvery').value),
       stride: Number($('setStride').value),
       weight: Number($('setWeight').value),
-      deviate: Number($('setDeviate').value)
+      deviate: Number($('setDeviate').value),
+      filter: Number($('setFilter').value),  // 1=떨림 보정, 0=원시값 그대로
+      turnGuide: Number($('setTurnGuide').value)
     };
   }
 
@@ -842,44 +1123,96 @@ const Tracker = (() => {
   }
 
   function onPosition(pos) {
-    const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+    const c = pos.coords;
+    const lat = c.latitude, lng = c.longitude;
+    const accuracy = isFinite(c.accuracy) ? c.accuracy : 0;
     const t = pos.timestamp || Date.now();
+    const s = settings();
 
+    /* ── 1) 화면 표시: 폰이 알려준 값 그대로 ──
+       어떤 보정·평활화도 하지 않습니다.
+       지도의 파란 점 = 폰의 GPS 그 자체, 둘레의 원 = 폰이 보고한 오차 반경 */
     CourseMap.showMe(lat, lng);
+    WalkMap.show(lat, lng, accuracy);
+    showRaw(lat, lng, accuracy, c.altitude, c.speed);
 
-    if (accuracy > MAX_ACCURACY) {
-      setGpsStatus('weak', `GPS 신호 약함 (오차 ${Math.round(accuracy)}m)`);
-      return;
+    const acc = Math.round(accuracy);
+    if (accuracy <= 15)                  setGpsStatus('good', `GPS 정확 (오차 ${acc}m)`);
+    else if (accuracy <= 40)             setGpsStatus('good', `GPS 보통 (오차 ${acc}m)`);
+    else if (accuracy <= TRUST_ACCURACY) setGpsStatus('weak', `GPS 약함 (오차 ${acc}m)`);
+    else                                 setGpsStatus('bad',  `GPS 불량 (오차 ${acc}m) — 거리 미반영`);
+
+    if (paused) { last = { lat, lng, t }; prev = { lat, lng, t }; return; }
+
+    /* ── 2) 튐 판정 ──
+       반드시 '직전 측정값'과 비교해야 합니다. 마지막으로 인정된 지점과 비교하면
+       오래 서 있다가 GPS가 100m 튀었을 때 (100m ÷ 300초 = 0.33m/s) 정상 걸음으로 오인합니다.
+       또한 기준에 오차 반경을 더해야 합니다. 오차 10m인 GPS는 가만히 있어도
+       1초 사이 15m씩 튀어 보이므로, 순수 속도만 보면 진짜 걸음까지 전부 버려집니다. */
+    let jumped = false;
+    if (prev) {
+      const dPrev = haversine(prev.lat, prev.lng, lat, lng);
+      const dtPrev = Math.max(0.001, (t - prev.t) / 1000);
+      jumped = dPrev > (MAX_SPEED * dtPrev + 3 * accuracy);
     }
-    setGpsStatus('good', `GPS 양호 (오차 ${Math.round(accuracy)}m)` +
-      (Pedometer.usingSensor() ? ' · 센서 걸음수' : ' · 거리 기반 걸음수'));
+    prev = { lat, lng, t };
 
-    if (paused) { last = { lat, lng, t }; return; }
-
-    if (last) {
-      const d = haversine(last.lat, last.lng, lat, lng);
-      const dt = Math.max(0.001, (t - last.t) / 1000);
-      const speed = d / dt;
-
-      if (d >= MIN_MOVE && speed <= MAX_SPEED) {
-        distance += d;
-        path.push([lat, lng]);
-        last = { lat, lng, t };
-        checkVoice();
-      } else if (speed > MAX_SPEED) {
-        // GPS가 튄 것으로 보고 기준점만 갱신
-        last = { lat, lng, t };
-      }
-    } else {
+    /* ── 3) 거리 누적 ── */
+    if (!last) {
       last = { lat, lng, t };
       path.push([lat, lng]);
+      WalkMap.addTrack(lat, lng);
+    } else {
+      const d = haversine(last.lat, last.lng, lat, lng);
+
+      // 보정을 끄면 폰이 준 값을 전부 그대로 더합니다.
+      // 켜면 오차 반경 수준의 미세 이동은 제자리 떨림으로 보고 넘깁니다.
+      // 계수 3.5는 실측으로 정한 값입니다.
+      // 낮으면 제자리 떨림이 거리로 쌓이고(1.8배일 때 10분 정지에 35m),
+      // 높이면 짧은 이동이 누락됩니다. 3.5배에서 보행오차 1.5%, 정지 유령거리 0m.
+      const noiseFloor  = s.filter ? Math.max(6, Math.min(35, accuracy * 3.5)) : 0;
+      const trustworthy = s.filter ? (accuracy <= TRUST_ACCURACY) : true;
+      const isJump      = s.filter && jumped;
+      const accept = trustworthy && !isJump && d >= noiseFloor;
+
+      if (accept) {
+        distance += d;
+        path.push([lat, lng]);
+        WalkMap.addTrack(lat, lng);
+        last = { lat, lng, t };
+        checkVoice();
+      } else if (isJump || !trustworthy) {
+        // 튀었거나 믿을 수 없는 값 → 거리엔 안 더하고 기준점만 다시 잡음
+        last = { lat, lng, t };
+      }
+      // 그 외(노이즈 수준의 미세 이동)는 last를 그대로 둡니다.
+      // 다음 측정 때 합산되므로 아무리 천천히 걸어도 거리가 누락되지 않습니다.
     }
 
-    // 코스 이탈 검사는 이동 여부와 무관하게 매번 실행합니다.
-    // (길을 잘못 들어 제자리에 서 있을 때야말로 경고가 필요하므로)
-    checkDeviation(lat, lng);
+    /* ── 4) 코스 이탈 — 멈춰 서 있어도 매번 검사 ── */
+    checkDeviation(lat, lng, accuracy);
+
+    /* ── 5) 회전 안내 ──
+       코스를 벗어난 상태에서는 엉뚱한 회전을 알려주므로 멈춥니다. */
+    if (s.turnGuide && Navi.ready() && accuracy <= 40) {
+      const msg = Navi.update(lat, lng, !wasOffCourse);
+      if (msg) {
+        Voice.speak(msg);
+        toast(msg, 3000);
+      }
+    }
 
     updateUI();
+  }
+
+  /** 폰이 준 원시 GPS 값을 그대로 표시 (문제 확인용) */
+  function showRaw(lat, lng, accuracy, alt, spd) {
+    const el = $('gpsRaw');
+    if (!el) return;
+    let s = `${lat.toFixed(6)}, ${lng.toFixed(6)}  ±${Math.round(accuracy)}m`;
+    if (alt !== null && isFinite(alt)) s += `  고도 ${Math.round(alt)}m`;
+    if (spd !== null && isFinite(spd) && spd > 0) s += `  ${(spd*3.6).toFixed(1)}km/h`;
+    el.textContent = s;
   }
 
   /** 일정 거리마다 음성 안내 */
@@ -908,9 +1241,13 @@ const Tracker = (() => {
    * - 계속 이탈 중이면 반복 경고. 점점 더 멀어지면 간격을 좁혀 더 자주 알림
    * - 기준의 70% 안쪽으로 돌아오면 "복귀" 안내 (경계선에서 껐다 켜졌다 하는 것 방지)
    */
-  function checkDeviation(lat, lng) {
+  function checkDeviation(lat, lng, accuracy) {
     const s = settings();
     if (!s.deviate || !courseRef || courseRef.length < 2) return;
+
+    // GPS 오차가 경고 기준보다 크면 이탈인지 아닌지 구분할 방법이 없습니다.
+    // 이때 경고를 내보내면 코스 위를 멀쩡히 걷는데도 알람이 울립니다.
+    if (accuracy > s.deviate) return;
 
     const off = distanceToPath(lat, lng, courseRef);
     const now = Date.now();
@@ -922,6 +1259,7 @@ const Tracker = (() => {
         lastDeviateWarn = 0;
         Voice.speak('코스로 돌아왔습니다.', { interrupt: true });
         toast('코스 복귀');
+        Navi.resync(lat, lng);   // 어디까지 왔는지 다시 잡아 회전 안내를 이어감
         if (navigator.vibrate) navigator.vibrate(60);
       }
       lastOffDistance = off;
@@ -987,10 +1325,18 @@ const Tracker = (() => {
     distance = 0;
     path = [];
     last = null;
+    prev = null;
     lastDeviateWarn = 0;
     lastOffDistance = 0;
     wasOffCourse = false;
     courseRef = (coursePoints && coursePoints.length >= 2) ? coursePoints : null;
+
+    WalkMap.reset();
+    WalkMap.setCourse(courseRef);
+
+    // 코스의 회전 지점을 미리 찾아둡니다.
+    Navi.build(courseRef);
+    WalkMap.setTurns(Navi.getTurns());
 
     const s = settings();
     nextVoiceAt = s.voiceEvery || Infinity;
@@ -999,17 +1345,20 @@ const Tracker = (() => {
 
     watchId = navigator.geolocation.watchPosition(onPosition, onError, {
       enableHighAccuracy: true,
-      timeout: 20000,
-      maximumAge: 1000
+      timeout: 30000,
+      maximumAge: 0     // 캐시된 옛 위치를 절대 쓰지 않고 항상 새로 측정
     });
 
     tickTimer = setInterval(updateUI, 1000);
 
     await Wake.on();
 
-    const intro = courseRef
-      ? `코스를 따라 걷기를 시작합니다. 총 ${(pathLength(courseRef) / 1000).toFixed(1)} 킬로미터입니다.`
-      : '걷기를 시작합니다.';
+    let intro = '걷기를 시작합니다.';
+    if (courseRef) {
+      const n = Navi.getTurns().length;
+      intro = `코스를 따라 걷기를 시작합니다. 총 ${(pathLength(courseRef) / 1000).toFixed(1)} 킬로미터` +
+              (settings().turnGuide && n ? `, 회전 ${n}곳입니다.` : '입니다.');
+    }
     Voice.speak(intro);
 
     if (!sensorOk) {
@@ -1083,7 +1432,7 @@ const Tracker = (() => {
     isRunning: () => running,
     isPaused: () => paused,
     reset() {
-      distance = 0; path = []; last = null;
+      distance = 0; path = []; last = null; prev = null;
       startedAt = 0; pausedTotal = 0; pausedAt = 0;
       updateUI();
     }
@@ -1281,6 +1630,12 @@ async function renderHistory() {
    GPX 파일 처리
    ------------------------------------------------------------ */
 
+/** 걷기 전 대기 상태의 현재 좌표 표시 */
+function showRawIdle(lat, lng, accuracy) {
+  const el = $('gpsRaw');
+  if (el) el.textContent = `${lat.toFixed(6)}, ${lng.toFixed(6)}  ±${Math.round(accuracy)}m  (대기 중)`;
+}
+
 function gpxNote(msg, kind) {
   const el = $('gpxNote');
   el.textContent = msg || '';
@@ -1323,12 +1678,7 @@ function handleGpxFile(file) {
     CourseMap.setPoints(data.points, name);
 
     const km = (pathLength(data.points) / 1000).toFixed(2);
-    let msg = `${data.kind} 불러옴 — ${km} km, 지점 ${data.points.length}개`;
-    if (data.originalCount > data.points.length) {
-      const diff = Math.abs(data.originalDistance - pathLength(data.points));
-      msg += ` (원본 ${data.originalCount.toLocaleString('ko-KR')}개에서 간략화, 거리 차이 ${Math.round(diff)}m)`;
-    }
-    gpxNote(msg, 'ok');
+    gpxNote(`${data.kind} 불러옴 — ${km} km · 지점 ${data.points.length.toLocaleString('ko-KR')}개 (원본 그대로)`, 'ok');
     toast(`"${name}" 불러오기 완료`);
   };
 
@@ -1343,7 +1693,9 @@ function switchView(name) {
   $('view-' + name).classList.add('is-active');
   document.querySelector(`.tab[data-view="${name}"]`).classList.add('is-active');
 
+  // 숨겨져 있던 지도는 크기를 다시 잡아줘야 제대로 그려집니다.
   if (name === 'plan') setTimeout(() => CourseMap.invalidate(), 100);
+  if (name === 'walk') setTimeout(() => { WalkMap.init(); WalkMap.invalidate(); }, 100);
   if (name === 'history') renderHistory();
 }
 
@@ -1489,8 +1841,19 @@ function bindUI() {
   $('btnPocket').addEventListener('click', () => Pocket.on());
   Pocket.bind();
 
+  // 내 위치 따라가기
+  $('btnFollow').addEventListener('click', () => WalkMap.setFollow(!WalkMap.isFollowing()));
+
+  // 걷기 전에도 고른 코스를 지도에 미리 보여줍니다.
+  $('walkCourse').addEventListener('change', async () => {
+    const cid = $('walkCourse').value;
+    if (!cid) { WalkMap.setCourse([]); return; }
+    const c = await DB.get('courses', cid);
+    if (c) WalkMap.setCourse(c.points);
+  });
+
   // 설정 저장/복원
-  ['setVoiceEvery', 'setStride', 'setWeight', 'setDeviate'].forEach((id) => {
+  ['setVoiceEvery', 'setStride', 'setWeight', 'setDeviate', 'setFilter', 'setTurnGuide'].forEach((id) => {
     const el = $(id);
     const saved = Prefs.get(id, null);
     if (saved !== null) el.value = saved;
@@ -1525,6 +1888,17 @@ function boot() {
   bindUI();
   renderCourses();
   renderHistory();
+
+  // 앱을 켜자마자 현재 위치를 한 번 잡아둡니다.
+  // 그래야 '걷기 시작'을 눌렀을 때 첫 위치가 곧바로 정확히 나옵니다.
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition((pos) => {
+      const c = pos.coords;
+      CourseMap.showMe(c.latitude, c.longitude);
+      WalkMap.show(c.latitude, c.longitude, c.accuracy);
+      showRawIdle(c.latitude, c.longitude, c.accuracy);
+    }, () => {}, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+  }
 
   setupServiceWorker();
 }
