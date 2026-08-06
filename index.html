@@ -155,13 +155,13 @@
           </select>
         </div>
         <div class="setting-item">
-          <label for="setVoiceEvery">거리 안내 간격</label>
-          <select id="setVoiceEvery">
-            <option value="250">250 m</option>
-            <option value="500" selected>500 m</option>
-            <option value="1000">1 km</option>
-            <option value="0">끄기</option>
-          </select>
+          <label for="setVoiceEvery">걸은 거리 보고 주기</label>
+          <input type="number" id="setVoiceEvery" value="500" min="0" max="1000" step="10" inputmode="numeric">
+          <p class="setting-help">
+            이만큼 걸을 때마다 "○○미터 지났습니다, ○분 걸었고 총 ○○걸음입니다"라고 알려줍니다.
+            10 m 단위로 1,000 m까지. <b>0을 넣으면 끕니다.</b>
+            (회전 안내와는 별개 기능입니다)
+          </p>
         </div>
         <div class="setting-item">
           <label for="setStride">보폭 (걸음수 계산)</label>
@@ -192,8 +192,9 @@
         <div class="setting-item">
           <label for="setDeviate">코스 이탈 경고</label>
           <select id="setDeviate">
+            <option value="20" selected>즉시 (20 m 벗어나면)</option>
             <option value="30">30 m 벗어나면</option>
-            <option value="50" selected>50 m 벗어나면</option>
+            <option value="50">50 m 벗어나면</option>
             <option value="100">100 m 벗어나면</option>
             <option value="0">끄기</option>
           </select>

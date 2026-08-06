@@ -289,7 +289,7 @@ body.dragging::after {
   color: var(--muted);
   margin-bottom: 6px;
 }
-select {
+select, input[type="number"] {
   width: 100%;
   padding: 12px;
   border-radius: 10px;
@@ -395,6 +395,14 @@ select {
 .settings summary::after { content: ' ▾'; }
 .settings[open] summary::after { content: ' ▴'; }
 .setting-item { margin-top: 14px; }
+.setting-help {
+  font-size: 11px;
+  color: #6b7385;
+  line-height: 1.6;
+  margin: 7px 0 0;
+}
+.setting-help b { color: var(--muted); font-weight: 600; }
+
 .fineprint {
   font-size: 11px;
   color: #6b7385;

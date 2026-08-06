@@ -144,7 +144,7 @@ const Navi = (() => {
   let TURN_MIN = 30;       // 도 — 이보다 작으면 회전이 아님 (노이즈에 따라 조절)
 
   const MERGE_DIST = 25;   // m — 이 안에 겹친 후보는 하나로 합침
-  const TRIGGERS = [400, 200, 80, 25];   // 안내 시점 (m 전)
+  const TRIGGERS = [400, 200, 80, 25, 6];   // 안내 시점 (m 전). 6m = 회전 지점 도달
   const STRAIGHT_MIN = 400;              // 이보다 긴 직선은 "직진하세요"
 
   /* ----------------------------------------------------------
@@ -246,6 +246,14 @@ const Navi = (() => {
     return right ? '오른쪽 방향' : '왼쪽 방향';
   }
 
+  /** 회전 지점에 도달했을 때 하는 말 */
+  function nowPhrase(text) {
+    if (text === '유턴') return '지금 유턴하세요.';
+    if (text === '오른쪽 방향') return '지금 오른쪽으로 가세요.';
+    if (text === '왼쪽 방향')   return '지금 왼쪽으로 가세요.';
+    return `지금 ${text} 하세요.`;   // 우회전 / 좌회전 / 크게 우회전 …
+  }
+
   /* ----------------------------------------------------------
      코스 분석 — 회전 지점 목록 만들기
      ---------------------------------------------------------- */
@@ -345,9 +353,13 @@ const Navi = (() => {
       if (rem <= trig && !t.said[trig]) {
         t.said[trig] = true;
         if (t.arrive) {
-          return trig <= 25 ? '목적지에 도착했습니다.' : `목적지까지 ${trig}미터 남았습니다.`;
+          if (trig <= 6) continue;                          // 도착은 25m에서 이미 안내함
+          if (trig <= 25) return '목적지에 도착했습니다.';
+          return `목적지까지 ${trig}미터 남았습니다.`;
         }
-        return trig <= 25 ? `잠시 후 ${t.text}입니다.` : `${trig}미터 앞에서 ${t.text}입니다.`;
+        if (trig <= 6)  return nowPhrase(t.text);          // 회전 지점 도달 → 즉시
+        if (trig <= 25) return `잠시 후 ${t.text}입니다.`;
+        return `${trig}미터 앞에서 ${t.text}입니다.`;
       }
     }
     return null;
@@ -1085,7 +1097,13 @@ const Tracker = (() => {
 
   function settings() {
     return {
-      voiceEvery: Number($('setVoiceEvery').value),
+      voiceEvery: (() => {
+        // 숫자 입력이라 사용자가 아무 값이나 넣을 수 있습니다.
+        // 0 = 끄기, 그 외에는 10~1000 m 범위로 맞춥니다.
+        let v = Math.round(Number($('setVoiceEvery').value) || 0);
+        if (v <= 0) return 0;
+        return Math.min(1000, Math.max(10, v));
+      })(),
       stride: Number($('setStride').value),
       weight: Number($('setWeight').value),
       deviate: Number($('setDeviate').value),
@@ -1243,15 +1261,17 @@ const Tracker = (() => {
     const s = settings();
     if (!s.deviate || !courseRef || courseRef.length < 2) return;
 
-    // GPS 오차가 경고 기준보다 크면 이탈인지 아닌지 구분할 방법이 없습니다.
-    // 이때 경고를 내보내면 코스 위를 멀쩡히 걷는데도 알람이 울립니다.
-    if (accuracy > s.deviate) return;
+    // 판정 기준에 GPS 오차를 반영합니다.
+    // 기준이 20m인데 오차가 30m면 20m 이탈을 구분할 수 없으므로,
+    // 그럴 땐 오차만큼으로 기준을 넓혀 헛경보를 막습니다.
+    // (예전처럼 아예 건너뛰면 도심에서 경고가 영영 안 울립니다)
+    const limit = Math.max(s.deviate, accuracy);
 
     const off = distanceToPath(lat, lng, courseRef);
     const now = Date.now();
 
     // --- 코스로 복귀 ---
-    if (off <= s.deviate * 0.7) {
+    if (off <= limit * 0.7) {
       if (wasOffCourse) {
         wasOffCourse = false;
         lastDeviateWarn = 0;
@@ -1265,7 +1285,7 @@ const Tracker = (() => {
     }
 
     // --- 경계선 안쪽 (아직 이탈 아님) ---
-    if (off <= s.deviate) {
+    if (off <= limit) {
       lastOffDistance = off;
       return;
     }
@@ -1856,6 +1876,7 @@ function bindUI() {
     const saved = Prefs.get(id, null);
     if (saved !== null) el.value = saved;
     el.addEventListener('change', () => Prefs.set(id, el.value));
+    if (el.tagName === 'INPUT') el.addEventListener('input', () => Prefs.set(id, el.value));
   });
 
   // 걷는 중에 실수로 앱을 닫는 것 방지
