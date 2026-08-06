@@ -67,6 +67,17 @@
         <button class="btn btn-primary" id="btnSaveCourse" type="button">저장</button>
       </div>
 
+      <!-- GPX 불러오기 / 내보내기
+           accept 속성을 일부러 넣지 않았습니다.
+           iOS 파일 앱이 .gpx를 모르는 형식으로 보고 선택을 막아버리기 때문에,
+           모든 파일을 고를 수 있게 두고 읽은 뒤 내용으로 검사합니다. -->
+      <div class="gpx-row">
+        <button class="btn btn-ghost-sm" id="btnImportGpx" type="button">GPX 불러오기</button>
+        <button class="btn btn-ghost-sm" id="btnExportCourse" type="button">GPX로 저장</button>
+      </div>
+      <input type="file" id="gpxFile" class="hidden">
+      <div class="gpx-note" id="gpxNote"></div>
+
       <div class="saved-courses">
         <div class="section-title">저장된 코스</div>
         <ul id="courseList" class="course-list">

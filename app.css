@@ -186,6 +186,50 @@ input[type="text"]::placeholder { color: #6b7385; }
 .btn-stop  { background: var(--danger); color: #fff; }
 .hidden { display: none !important; }
 
+/* ---------- GPX 불러오기 / 내보내기 ---------- */
+.gpx-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.btn-ghost-sm {
+  flex: 1;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 11px 10px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.btn-ghost-sm:active { background: var(--panel-2); }
+.gpx-note {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.55;
+  margin-bottom: 16px;
+  min-height: 0;
+}
+.gpx-note:empty { display: none; }
+.gpx-note.err { color: var(--danger); }
+.gpx-note.ok { color: var(--accent); }
+
+/* 데스크톱에서 파일을 끌어다 놓을 때 */
+body.dragging::after {
+  content: 'GPX 파일을 놓으세요';
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15,17,21,.9);
+  border: 3px dashed var(--accent);
+  color: var(--accent);
+  font-size: 18px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
 /* ---------- 저장된 코스 ---------- */
 .section-title {
   font-size: 13px;

@@ -106,6 +106,230 @@ function toast(msg, ms = 2600) {
 }
 
 
+/**
+ * 경로 단순화 — Douglas-Peucker 알고리즘
+ * ------------------------------------------------------------
+ * GPS 기록기는 1~5m마다 점을 찍기 때문에 5km 코스가 3천 개 점이 되곤 합니다.
+ * 모양은 그대로 두고 점 개수만 줄여서 앱이 느려지지 않게 합니다.
+ * tolMeters: 이 거리 안쪽으로 벗어나는 점은 없애도 된다고 판단
+ */
+function simplifyPath(pts, tolMeters) {
+  const n = pts.length;
+  if (n <= 2 || tolMeters <= 0) return pts.slice();
+
+  // 짧은 범위에서는 위경도를 평면 좌표(미터)로 근사해도 됩니다.
+  const toRad = Math.PI / 180;
+  const lat0 = pts[0][0];
+  const kx = EARTH_R * toRad * Math.cos(lat0 * toRad); // 경도 1도 → 미터
+  const ky = EARTH_R * toRad;                          // 위도 1도 → 미터
+  const P = pts.map((p) => [p[1] * kx, p[0] * ky]);
+
+  const keep = new Array(n).fill(false);
+  keep[0] = true;
+  keep[n - 1] = true;
+
+  const stack = [[0, n - 1]];
+  while (stack.length) {
+    const [s, e] = stack.pop();
+    if (e - s < 2) continue;
+
+    const ax = P[s][0], ay = P[s][1];
+    const bx = P[e][0], by = P[e][1];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+
+    let maxD = -1, idx = -1;
+    for (let i = s + 1; i < e; i++) {
+      const px = P[i][0], py = P[i][1];
+      let t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+      t = Math.max(0, Math.min(1, t));
+      const d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+      if (d > maxD) { maxD = d; idx = i; }
+    }
+
+    if (maxD > tolMeters && idx > 0) {
+      keep[idx] = true;
+      stack.push([s, idx], [idx, e]);
+    }
+  }
+
+  return pts.filter((_, i) => keep[i]);
+}
+
+
+/* ============================================================
+   1-A. GPX 파일 읽기 / 만들기
+   ------------------------------------------------------------
+   전부 브라우저 안에서 처리합니다. 파일이 폰 밖으로 나가지 않습니다.
+   ============================================================ */
+
+const GPX = (() => {
+
+  /**
+   * 네임스페이스에 상관없이 태그를 찾습니다.
+   * (GPX 파일마다 <trkpt> 또는 <gpx:trkpt> 로 제각각이라서)
+   */
+  function findTags(root, tagName) {
+    let list = root.getElementsByTagNameNS('*', tagName);
+    if (list.length === 0) list = root.getElementsByTagName(tagName);
+    return Array.from(list);
+  }
+
+  /**
+   * GPX 텍스트 → { name, points, kind, original }
+   * 실패하면 Error를 던집니다.
+   */
+  // 단순화 허용 오차 (미터).
+  // 코스 이탈 경고 기준이 기본 50m이므로, 그보다 훨씬 작아야
+  // 단순화 때문에 엉뚱한 이탈 경고가 뜨지 않습니다.
+  // 도시에서 나란히 붙은 두 골목(약 15~20m 간격)도 구분되는 값입니다.
+  function parse(text, tolMeters = 8) {
+    if (!text || !text.trim()) {
+      throw new Error('파일이 비어 있습니다.');
+    }
+    // BOM 제거 (윈도우에서 만든 파일 대응)
+    text = text.replace(/^﻿/, '').trim();
+
+    if (text.indexOf('<gpx') === -1 && text.indexOf(':gpx') === -1) {
+      throw new Error('GPX 파일이 아닙니다. 확장자가 .gpx 인 파일을 선택해 주세요.');
+    }
+
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    if (doc.getElementsByTagName('parsererror').length > 0) {
+      throw new Error('파일이 손상되었거나 형식이 올바르지 않습니다.');
+    }
+
+    const root = doc.documentElement;
+    if (!root) throw new Error('파일을 읽을 수 없습니다.');
+
+    // 좌표를 담고 있는 태그를 우선순위대로 찾습니다.
+    //   trkpt : 실제로 걸은 궤적 (가장 흔함)
+    //   rtept : 미리 계획한 경로
+    //   wpt   : 개별 지점만 찍어놓은 경우
+    let nodes = findTags(root, 'trkpt');
+    let kind = '트랙';
+    if (nodes.length === 0) { nodes = findTags(root, 'rtept'); kind = '경로'; }
+    if (nodes.length === 0) { nodes = findTags(root, 'wpt');   kind = '지점'; }
+
+    if (nodes.length === 0) {
+      throw new Error('파일 안에 좌표가 없습니다.');
+    }
+
+    const raw = [];
+    for (const nd of nodes) {
+      const lat = parseFloat(nd.getAttribute('lat'));
+      const lon = parseFloat(nd.getAttribute('lon'));
+      // 값이 이상한 점은 건너뜁니다.
+      if (!isFinite(lat) || !isFinite(lon)) continue;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
+      if (lat === 0 && lon === 0) continue; // 흔한 오류값
+      raw.push([lat, lon]);
+    }
+
+    if (raw.length < 2) {
+      throw new Error('쓸 수 있는 좌표가 2개 미만입니다.');
+    }
+
+    // 코스 이름 찾기 (트랙 이름 → 메타데이터 이름 순)
+    let name = '';
+    const trks = findTags(root, 'trk');
+    if (trks.length) {
+      const n = findTags(trks[0], 'name')[0];
+      if (n) name = (n.textContent || '').trim();
+    }
+    if (!name) {
+      const meta = findTags(root, 'metadata')[0];
+      if (meta) {
+        const n = findTags(meta, 'name')[0];
+        if (n) name = (n.textContent || '').trim();
+      }
+    }
+    if (!name) {
+      const rtes = findTags(root, 'rte');
+      if (rtes.length) {
+        const n = findTags(rtes[0], 'name')[0];
+        if (n) name = (n.textContent || '').trim();
+      }
+    }
+    name = name.slice(0, 30);
+
+    // ── 점 개수 줄이기 ──
+    // GPS 기록기가 만든 촘촘한 트랙만 줄입니다.
+    // 손으로 찍은 경로(rtept)나 지점(wpt), 점이 적은 파일은
+    // 하나하나가 의도적으로 찍은 것이므로 절대 건드리지 않습니다.
+    const DENSE_THRESHOLD = 100;
+    const shouldSimplify = (kind === '트랙') && (raw.length > DENSE_THRESHOLD);
+    const points = shouldSimplify ? simplifyPath(raw, tolMeters) : raw;
+
+    return {
+      name,
+      points,
+      kind,
+      originalCount: raw.length,
+      originalDistance: pathLength(raw)
+    };
+  }
+
+  /** XML에 그대로 넣으면 안 되는 문자 처리 */
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  }
+
+  /**
+   * 좌표 배열 → GPX 텍스트
+   * asTrack=true 면 <trk>(걸은 기록), false 면 <rte>(계획 코스)
+   */
+  function build(name, points, { asTrack = false, startTime = null } = {}) {
+    const tag = asTrack ? 'trkpt' : 'rtept';
+    const body = points.map(([lat, lng]) =>
+      `      <${tag} lat="${lat.toFixed(7)}" lon="${lng.toFixed(7)}"></${tag}>`
+    ).join('\n');
+
+    const meta = startTime
+      ? `  <metadata>\n    <name>${esc(name)}</name>\n    <time>${new Date(startTime).toISOString()}</time>\n  </metadata>\n`
+      : `  <metadata>\n    <name>${esc(name)}</name>\n  </metadata>\n`;
+
+    const inner = asTrack
+      ? `  <trk>\n    <name>${esc(name)}</name>\n    <trkseg>\n${body}\n    </trkseg>\n  </trk>\n`
+      : `  <rte>\n    <name>${esc(name)}</name>\n${body}\n  </rte>\n`;
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="걷기 내비" xmlns="http://www.topografix.com/GPX/1/1">
+${meta}${inner}</gpx>
+`;
+  }
+
+  /**
+   * 파일로 저장.
+   * 새 탭을 열지 않고 다운로드만 발생시킵니다.
+   */
+  function download(filename, text) {
+    const blob = new Blob([text], { type: 'application/gpx+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.target = '_self';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 1200);
+  }
+
+  /** 파일명으로 못 쓰는 문자 정리 */
+  function safeName(s) {
+    return String(s || '코스').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40);
+  }
+
+  return { parse, build, download, safeName };
+})();
+
+
 /* ============================================================
    1. 저장소 (IndexedDB)
    ============================================================ */
@@ -413,18 +637,37 @@ const CourseMap = (() => {
     setTimeout(() => map.invalidateSize(), 300);
   }
 
-  function addPoint(lat, lng) {
-    points.push([lat, lng]);
-    const idx = points.length;
-    const m = L.circleMarker([lat, lng], {
+  // 점이 이보다 많으면(GPX로 불러온 경우) 시작·도착만 표시합니다.
+  // 수백 개 마커를 그리면 지도가 버벅이기 때문입니다.
+  const MAX_MARKERS = 40;
+
+  function makeDot(p, label) {
+    return L.circleMarker([p[0], p[1]], {
       radius: 6,
       color: '#ffffff',
       weight: 2,
       fillColor: '#22c55e',
       fillOpacity: 1
-    }).addTo(map).bindTooltip(String(idx), { permanent: false });
-    markers.push(m);
+    }).addTo(map).bindTooltip(String(label), { permanent: false });
+  }
+
+  function redrawMarkers() {
+    markers.forEach((m) => map.removeLayer(m));
+    markers = [];
+    if (points.length === 0) return;
+
+    if (points.length <= MAX_MARKERS) {
+      points.forEach((p, i) => markers.push(makeDot(p, i + 1)));
+    } else {
+      markers.push(makeDot(points[0], '시작'));
+      markers.push(makeDot(points[points.length - 1], '도착'));
+    }
+  }
+
+  function addPoint(lat, lng) {
+    points.push([lat, lng]);
     polyline.setLatLngs(points);
+    redrawMarkers();
     loadedCourseId = null;
     render();
   }
@@ -432,9 +675,8 @@ const CourseMap = (() => {
   function undo() {
     if (points.length === 0) return;
     points.pop();
-    const m = markers.pop();
-    if (m) map.removeLayer(m);
     polyline.setLatLngs(points);
+    redrawMarkers();
     render();
   }
 
@@ -445,18 +687,30 @@ const CourseMap = (() => {
     polyline.setLatLngs([]);
     loadedCourseId = null;
     $('courseName').value = '';
+    $('gpxNote').textContent = '';
+    $('gpxNote').className = 'gpx-note';
+    render();
+  }
+
+  /** 좌표 배열을 한 번에 올립니다 (GPX 불러오기, 저장된 코스 열기) */
+  function setPoints(pts, name) {
+    points = pts.slice();
+    polyline.setLatLngs(points);
+    redrawMarkers();
+    loadedCourseId = null;
+    if (name) $('courseName').value = name;
+    if (points.length > 1) {
+      map.fitBounds(polyline.getBounds(), { padding: [30, 30] });
+    } else if (points.length === 1) {
+      map.setView(points[0], 16);
+    }
     render();
   }
 
   function load(course) {
     clear();
-    course.points.forEach((p) => addPoint(p[0], p[1]));
+    setPoints(course.points, course.name);
     loadedCourseId = course.id;
-    $('courseName').value = course.name;
-    if (points.length > 0) {
-      map.fitBounds(polyline.getBounds(), { padding: [30, 30] });
-    }
-    render();
   }
 
   function render() {
@@ -503,7 +757,7 @@ const CourseMap = (() => {
   }
 
   return {
-    init, undo, clear, load, locate, showMe,
+    init, undo, clear, load, locate, showMe, setPoints,
     getPoints: () => points.slice(),
     getMap: () => map,
     invalidate: () => { if (map) map.invalidateSize(); }
@@ -983,6 +1237,24 @@ async function renderHistory() {
     main.appendChild(name);
     main.appendChild(sub);
 
+    // 걸은 경로를 GPX 파일로 저장
+    const bGpx = document.createElement('button');
+    bGpx.className = 'ci-btn';
+    bGpx.type = 'button';
+    bGpx.textContent = 'GPX';
+    bGpx.addEventListener('click', () => {
+      if (!w.path || w.path.length < 2) {
+        toast('저장된 경로가 없는 기록입니다.');
+        return;
+      }
+      const label = `걷기 ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      GPX.download(
+        GPX.safeName(label) + '.gpx',
+        GPX.build(label, w.path, { asTrack: true, startTime: w.date })
+      );
+      toast('GPX 파일로 저장했습니다.');
+    });
+
     const bDel = document.createElement('button');
     bDel.className = 'ci-btn danger';
     bDel.type = 'button';
@@ -994,6 +1266,7 @@ async function renderHistory() {
     });
 
     li.appendChild(main);
+    li.appendChild(bGpx);
     li.appendChild(bDel);
     ul.appendChild(li);
   });
@@ -1003,6 +1276,66 @@ async function renderHistory() {
 /* ============================================================
    9. 화면 전환 & 이벤트 연결
    ============================================================ */
+
+/* ------------------------------------------------------------
+   GPX 파일 처리
+   ------------------------------------------------------------ */
+
+function gpxNote(msg, kind) {
+  const el = $('gpxNote');
+  el.textContent = msg || '';
+  el.className = 'gpx-note' + (kind ? ' ' + kind : '');
+}
+
+/** 파일 하나를 읽어 코스로 올립니다. */
+function handleGpxFile(file) {
+  // 사진 등을 잘못 고른 경우를 먼저 걸러냅니다.
+  if (file.size > 20 * 1024 * 1024) {
+    gpxNote('파일이 너무 큽니다 (20MB 초과).', 'err');
+    return;
+  }
+  if (file.type && file.type.startsWith('image/')) {
+    gpxNote('사진 파일입니다. .gpx 파일을 선택해 주세요.', 'err');
+    return;
+  }
+
+  gpxNote('파일을 읽는 중…');
+
+  const reader = new FileReader();
+
+  reader.onerror = () => {
+    gpxNote('파일을 읽지 못했습니다. 다시 시도해 주세요.', 'err');
+  };
+
+  reader.onload = () => {
+    let data;
+    try {
+      data = GPX.parse(String(reader.result));
+    } catch (err) {
+      gpxNote(err.message, 'err');
+      return;
+    }
+
+    // 이름이 파일에 없으면 파일명에서 가져옵니다.
+    const fallbackName = file.name.replace(/\.[^.]+$/, '').slice(0, 30);
+    const name = data.name || fallbackName || 'GPX 코스';
+
+    CourseMap.setPoints(data.points, name);
+
+    const km = (pathLength(data.points) / 1000).toFixed(2);
+    let msg = `${data.kind} 불러옴 — ${km} km, 지점 ${data.points.length}개`;
+    if (data.originalCount > data.points.length) {
+      const diff = Math.abs(data.originalDistance - pathLength(data.points));
+      msg += ` (원본 ${data.originalCount.toLocaleString('ko-KR')}개에서 간략화, 거리 차이 ${Math.round(diff)}m)`;
+    }
+    gpxNote(msg, 'ok');
+    toast(`"${name}" 불러오기 완료`);
+  };
+
+  // GPX는 UTF-8 텍스트입니다.
+  reader.readAsText(file, 'UTF-8');
+}
+
 
 function switchView(name) {
   document.querySelectorAll('.view').forEach((v) => v.classList.remove('is-active'));
@@ -1032,6 +1365,55 @@ function bindUI() {
   $('btnClear').addEventListener('click', () => {
     if (CourseMap.getPoints().length === 0) return;
     if (confirm('그린 코스를 모두 지울까요?')) CourseMap.clear();
+  });
+
+  // ---------- GPX 불러오기 ----------
+  const gpxInput = $('gpxFile');
+
+  $('btnImportGpx').addEventListener('click', () => {
+    gpxInput.value = '';   // 같은 파일을 다시 골라도 이벤트가 뜨도록
+    gpxInput.click();
+  });
+
+  gpxInput.addEventListener('change', () => {
+    const f = gpxInput.files && gpxInput.files[0];
+    if (f) handleGpxFile(f);
+  });
+
+  // 데스크톱에서 파일을 끌어다 놓기
+  ['dragenter', 'dragover'].forEach((ev) => {
+    document.addEventListener(ev, (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      e.preventDefault();
+      document.body.classList.add('dragging');
+    });
+  });
+  ['dragleave', 'drop'].forEach((ev) => {
+    document.addEventListener(ev, (e) => {
+      if (ev === 'drop') e.preventDefault();
+      if (ev === 'dragleave' && e.relatedTarget) return;
+      document.body.classList.remove('dragging');
+    });
+  });
+  document.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) handleGpxFile(f);
+  });
+
+  // ---------- GPX 내보내기 (현재 그린 코스) ----------
+  $('btnExportCourse').addEventListener('click', () => {
+    const pts = CourseMap.getPoints();
+    if (pts.length < 2) {
+      gpxNote('내보낼 코스가 없습니다. 지점을 2개 이상 찍거나 코스를 불러오세요.', 'err');
+      return;
+    }
+    const name = $('courseName').value.trim() || '걷기 코스';
+    try {
+      GPX.download(GPX.safeName(name) + '.gpx', GPX.build(name, pts, { asTrack: false }));
+      gpxNote(`"${name}" 을(를) GPX 파일로 저장했습니다.`, 'ok');
+    } catch (e) {
+      gpxNote('파일을 저장하지 못했습니다: ' + e.message, 'err');
+    }
   });
 
   // 코스 저장
