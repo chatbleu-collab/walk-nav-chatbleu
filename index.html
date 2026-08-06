@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <title>걷기 내비</title>
+
+  <!-- PWA 설정 -->
+  <link rel="manifest" href="./manifest.json">
+  <meta name="theme-color" content="#0f1115">
+  <meta name="description" content="코스를 그려 거리를 재고, 걷는 동안 음성으로 안내받는 워킹 앱">
+
+  <!-- 아이콘 -->
+  <link rel="icon" href="./icons/icon-192.png">
+  <link rel="apple-touch-icon" href="./icons/icon-192.png">
+
+  <!-- iOS 홈 화면 추가 시 전체화면으로 실행 -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="걷기내비">
+
+  <!-- 지도 라이브러리 (Leaflet + OpenStreetMap) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+
+  <!-- ========== 상단 탭 ========== -->
+  <nav class="tabbar" id="tabbar">
+    <button class="tab is-active" data-view="plan" type="button">코스</button>
+    <button class="tab" data-view="walk" type="button">걷기</button>
+    <button class="tab" data-view="history" type="button">기록</button>
+  </nav>
+
+  <!-- ========== 1) 코스 만들기 화면 ========== -->
+  <section class="view is-active" id="view-plan">
+    <div id="map"></div>
+
+    <div class="map-tools">
+      <button class="mini" id="btnLocate" type="button" title="내 위치로">◎</button>
+      <button class="mini" id="btnUndo" type="button" title="마지막 점 취소">↶</button>
+      <button class="mini" id="btnClear" type="button" title="전체 지우기">✕</button>
+    </div>
+
+    <div class="panel">
+      <div class="hint" id="planHint">지도를 탭해서 걸을 코스의 지점을 순서대로 찍으세요.</div>
+
+      <div class="stat-row">
+        <div class="stat">
+          <div class="stat-label">코스 거리</div>
+          <div class="stat-value"><span id="planDistance">0.00</span><small>km</small></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">찍은 지점</div>
+          <div class="stat-value"><span id="planPoints">0</span><small>개</small></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">예상 시간</div>
+          <div class="stat-value"><span id="planEta">0</span><small>분</small></div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <input type="text" id="courseName" placeholder="코스 이름 (예: 한강 산책)" maxlength="30" autocomplete="off">
+        <button class="btn btn-primary" id="btnSaveCourse" type="button">저장</button>
+      </div>
+
+      <div class="saved-courses">
+        <div class="section-title">저장된 코스</div>
+        <ul id="courseList" class="course-list">
+          <li class="empty">아직 저장된 코스가 없습니다.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== 2) 걷기 화면 ========== -->
+  <section class="view" id="view-walk">
+    <div class="walk-wrap">
+
+      <div class="course-pick">
+        <label for="walkCourse">따라 걸을 코스</label>
+        <select id="walkCourse">
+          <option value="">— 코스 없이 자유롭게 걷기 —</option>
+        </select>
+      </div>
+
+      <div class="big-stats">
+        <div class="big">
+          <div class="big-value" id="wDistance">0.00</div>
+          <div class="big-label">킬로미터</div>
+        </div>
+        <div class="sub-grid">
+          <div class="sub">
+            <div class="sub-value" id="wTime">00:00</div>
+            <div class="sub-label">시간</div>
+          </div>
+          <div class="sub">
+            <div class="sub-value" id="wSteps">0</div>
+            <div class="sub-label">걸음</div>
+          </div>
+          <div class="sub">
+            <div class="sub-value" id="wPace">--'--"</div>
+            <div class="sub-label">페이스/km</div>
+          </div>
+          <div class="sub">
+            <div class="sub-value" id="wKcal">0</div>
+            <div class="sub-label">칼로리</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="status-line">
+        <span class="dot" id="gpsDot"></span>
+        <span id="gpsText">GPS 대기 중</span>
+      </div>
+
+      <div class="walk-buttons">
+        <button class="btn btn-big btn-start" id="btnStart" type="button">걷기 시작</button>
+        <button class="btn btn-big btn-pause hidden" id="btnPause" type="button">일시정지</button>
+        <button class="btn btn-big btn-stop hidden" id="btnStop" type="button">종료</button>
+      </div>
+
+      <button class="btn btn-ghost hidden" id="btnPocket" type="button">
+        주머니 모드 (화면 잠금)
+      </button>
+
+      <details class="settings">
+        <summary>설정</summary>
+        <div class="setting-item">
+          <label for="setVoiceEvery">음성 안내 간격</label>
+          <select id="setVoiceEvery">
+            <option value="250">250 m</option>
+            <option value="500" selected>500 m</option>
+            <option value="1000">1 km</option>
+            <option value="0">끄기</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label for="setStride">보폭 (걸음수 계산)</label>
+          <select id="setStride">
+            <option value="0.60">60 cm (작은 편)</option>
+            <option value="0.70" selected>70 cm (보통)</option>
+            <option value="0.75">75 cm (큰 편)</option>
+            <option value="0.80">80 cm (아주 큼)</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label for="setWeight">체중 (칼로리 계산)</label>
+          <select id="setWeight">
+            <option value="50">50 kg</option>
+            <option value="60">60 kg</option>
+            <option value="70" selected>70 kg</option>
+            <option value="80">80 kg</option>
+            <option value="90">90 kg</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <label for="setDeviate">코스 이탈 경고</label>
+          <select id="setDeviate">
+            <option value="30">30 m 벗어나면</option>
+            <option value="50" selected>50 m 벗어나면</option>
+            <option value="100">100 m 벗어나면</option>
+            <option value="0">끄기</option>
+          </select>
+        </div>
+        <p class="fineprint">
+          걸음수는 폰의 가속도 센서로 추정한 값이라 실제와 5~10% 차이가 날 수 있습니다.
+        </p>
+      </details>
+
+    </div>
+  </section>
+
+  <!-- ========== 3) 기록 화면 ========== -->
+  <section class="view" id="view-history">
+    <div class="panel panel-full">
+      <div class="section-title">걷기 기록</div>
+      <div class="summary-box" id="historySummary">
+        <div><span id="sumCount">0</span><small>회</small></div>
+        <div><span id="sumKm">0.0</span><small>km</small></div>
+        <div><span id="sumSteps">0</span><small>걸음</small></div>
+      </div>
+      <ul id="historyList" class="history-list">
+        <li class="empty">아직 기록이 없습니다.</li>
+      </ul>
+      <p class="fineprint">
+        모든 기록은 이 폰 안에만 저장됩니다. 서버로 전송되지 않으며 그 누구도 볼 수 없습니다.
+      </p>
+    </div>
+  </section>
+
+  <!-- ========== 주머니 모드 오버레이 ========== -->
+  <div class="pocket" id="pocket">
+    <div class="pocket-inner">
+      <div class="pocket-dist" id="pDistance">0.00 km</div>
+      <div class="pocket-time" id="pTime">00:00</div>
+      <div class="pocket-hint">화면 잠김 · 길게 눌러서 해제</div>
+    </div>
+  </div>
+
+  <!-- ========== 알림 토스트 ========== -->
+  <div class="toast" id="toast"></div>
+
+  <!-- 지도 라이브러리 -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
